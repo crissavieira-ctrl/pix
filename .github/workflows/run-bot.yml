@@ -1,0 +1,60 @@
+name: Run Pix Bot (Daily)
+
+on:
+  schedule:
+    # AJUSTE O HORÁRIO AQUI (sempre em UTC):
+    # Ex.: 07:30 em Brasília (BRT = UTC-3) => 10:30 UTC
+    - cron: "30 10 * * *"
+  workflow_dispatch: {}   # permite rodar manualmente
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      # Força coleta por HTTP (sem Selenium) no CI
+      GITHUB_ACTIONS: "true"
+      # Onde salvar o Excel no CI (a sua versão do script já usa isso)
+      OUT_DIR: "./output"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Se precisar de variáveis secretas (tokens, credenciais), crie em:
+      # Settings > Secrets and variables > Actions > New repository secret
+      # e exporte assim:
+      # - name: Export secrets
+      #   run: |
+      #     echo "API_KEY=${{ secrets.API_KEY }}" >> $GITHUB_ENV
+
+      - name: Run bot (mês padrão ou intervalo)
+        run: |
+          python bot.py
+          # Para rodar intervalo específico, troque a linha acima por:
+          # python bot.py 202501 202508
+
+      - name: Upload Excel artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pix_pordia_xlsx
+          path: output/pix_pordia.xlsx
+          if-no-files-found: warn
