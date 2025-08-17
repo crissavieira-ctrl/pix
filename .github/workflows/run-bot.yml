@@ -1,4 +1,4 @@
-name: Run Pix Bot (TEST every 5 min)
+name: Run Pix Bot Daily
 
 on:
   schedule:
