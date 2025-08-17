@@ -3,7 +3,7 @@ name: Run Pix Bot (Daily)
 on:
   schedule:
     # 21:10 Brasília (UTC-3) => 00:10 UTC (dia seguinte)
-    - cron: "10 0 * * *"
+    - cron: "20 00 * * *"
   workflow_dispatch: {}
 
 permissions:
