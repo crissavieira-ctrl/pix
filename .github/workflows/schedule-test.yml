@@ -2,7 +2,7 @@ name: Schedule Sanity Check
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # roda a cada 5 minutos (UTC)
+    - cron: "*/1 * * * *"   # roda a cada 1 minuto (UTC)
   workflow_dispatch:
 
 jobs:
@@ -10,4 +10,3 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo "Triggered by ${{ github.event_name }} at $(date -u) UTC"
-
