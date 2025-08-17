@@ -2,9 +2,9 @@ name: Run Pix Bot (Daily)
 
 on:
   schedule:
-    # 21:20 Brasília (UTC-3) => 00:20 UTC (dia seguinte)
+    # 21:20 Brasília (UTC-3) => 00:20 UTC
     - cron: "20 0 * * *"
-    # Retry automático 15 min depois (00:35 UTC => 21:35 BRT)
+    # opcional: retry 15 min depois
     - cron: "35 0 * * *"
   workflow_dispatch: {}
 
