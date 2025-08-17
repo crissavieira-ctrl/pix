@@ -2,23 +2,27 @@ name: Run Pix Bot (Daily)
 
 on:
   schedule:
-    # AJUSTE O HORÁRIO AQUI (sempre em UTC):
-    # Ex.: 07:30 em Brasília (BRT = UTC-3) => 10:30 UTC
-    - cron: "10 00 * * *"
-  workflow_dispatch: {}   # permite rodar manualmente
+    # 21:10 Brasília (UTC-3) => 00:10 UTC (dia seguinte)
+    - cron: "10 0 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # permite commitar no repositório
 
 jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      # Força coleta por HTTP (sem Selenium) no CI
+      # Força modo HTTP (sem Selenium) no CI
       GITHUB_ACTIONS: "true"
-      # Onde salvar o Excel no CI (a sua versão do script já usa isso)
-      OUT_DIR: "./output"
+      # Salva/ler o Excel na raiz do repositório
+      OUT_DIR: "."
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # garante histórico para commit
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,9 +42,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Se precisar de variáveis secretas (tokens, credenciais), crie em:
-      # Settings > Secrets and variables > Actions > New repository secret
-      # e exporte assim:
+      # Se precisar de segredos, descomente e use Secrets do repo:
       # - name: Export secrets
       #   run: |
       #     echo "API_KEY=${{ secrets.API_KEY }}" >> $GITHUB_ENV
@@ -48,13 +50,31 @@ jobs:
       - name: Run bot (mês padrão ou intervalo)
         run: |
           python bot.py
-          # Para rodar intervalo específico, troque a linha acima por:
+          # Exemplo para intervalo:
           # python bot.py 202501 202508
 
-      - name: Upload Excel artifact
+      - name: Upload Excel as artifact (backup/consulta)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pix_pordia_xlsx
-          path: output/pix_pordia.xlsx
+          path: pix_pordia.xlsx
           if-no-files-found: warn
+
+      - name: Commit updated Excel back to repo
+        run: |
+          set -e
+          if [ -f "pix_pordia.xlsx" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add pix_pordia.xlsx
+            # só commita se houver mudança
+            if git diff --cached --quiet; then
+              echo "Nenhuma mudança no Excel. Nada a commitar."
+            else
+              git commit -m "Update pix_pordia.xlsx [skip ci]"
+              git push
+            fi
+          else
+            echo "Arquivo pix_pordia.xlsx não encontrado para commit."
+          fi
