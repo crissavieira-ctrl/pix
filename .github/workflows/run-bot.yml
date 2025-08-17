@@ -2,8 +2,10 @@ name: Run Pix Bot (Daily)
 
 on:
   schedule:
-    # 21:10 Brasília (UTC-3) => 00:10 UTC (dia seguinte)
+    # 21:20 Brasília (UTC-3) => 00:20 UTC (dia seguinte)
     - cron: "20 0 * * *"
+    # Retry automático 15 min depois (00:35 UTC => 21:35 BRT)
+    - cron: "35 0 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -42,7 +44,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Se precisar de segredos, descomente e use Secrets do repo:
+      # Se precisar de segredos, use:
       # - name: Export secrets
       #   run: |
       #     echo "API_KEY=${{ secrets.API_KEY }}" >> $GITHUB_ENV
