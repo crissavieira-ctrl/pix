@@ -15,11 +15,11 @@ Regras:
 
 from __future__ import annotations
 
-# --- Selenium agora é opcional: roda sem ele no GitHub Actions ---
+# --- Selenium opcional (usado só localmente, no CI usamos HTTP) ---
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
-except Exception:  # sem selenium no ambiente (ex.: CI)
+except Exception:  # sem selenium disponível
     webdriver = None  # type: ignore
     Options = None    # type: ignore
 
@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import re
 
-# Coleta via HTTP (para CI)
+# Coleta via HTTP (CI/GitHub Actions)
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -40,12 +40,14 @@ from urllib3.util.retry import Retry
 # =======================
 # CONFIGURAÇÕES
 # =======================
-# Detecta se está no GitHub Actions
+# Detecta ambiente GitHub Actions
 GHA = os.getenv("GITHUB_ACTIONS", "").lower() in ("1", "true", "yes")
 
 # Caminho de saída:
+# - No CI (Actions), o workflow define OUT_DIR=".", então salva na raiz do repo
+# - Localmente, mantém o caminho anterior por padrão (pode sobrescrever com OUT_DIR)
 DEFAULT_OUT_DIR = r"D:\User\Desktop\pix"
-OUT_DIR = os.getenv("OUT_DIR", "./output" if GHA else DEFAULT_OUT_DIR)
+OUT_DIR = os.getenv("OUT_DIR", "." if GHA else DEFAULT_OUT_DIR)
 OUT_XLSX = os.path.join(OUT_DIR, "pix_pordia.xlsx")
 
 SHEET_WIDE_T = "wide_t"   # única aba mantida
@@ -109,7 +111,7 @@ def build_url_parametrized(base_url: str, yyyymm: int) -> str:
         f"&$top=10000"
     )
 
-# ---------- coleta sem navegador (para CI/GitHub Actions) ----------
+# ---------- coleta sem navegador (CI/HTTP) ----------
 def fetch_json_via_http(url: str) -> dict:
     sess = requests.Session()
     retries = Retry(
@@ -123,7 +125,7 @@ def fetch_json_via_http(url: str) -> dict:
     r.raise_for_status()
     return r.json()
 
-# ---------- coleta via navegador (local, se preferir Selenium) ----------
+# ---------- coleta com navegador (local, Selenium) ----------
 def fetch_json_via_browser(driver: "webdriver.Chrome", url: str) -> dict:  # type: ignore[name-defined]
     script = """
         const url = arguments[0];
@@ -160,12 +162,8 @@ def fetch_json_via_browser(driver: "webdriver.Chrome", url: str) -> dict:  # typ
 def ensure_out_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
-# ---------- escolhe método de coleta conforme ambiente ----------
+# ---------- dispatcher: escolhe HTTP (CI) ou Selenium (local) ----------
 def fetch_pix_por_municipio(driver: "webdriver.Chrome | None", yyyymm: int) -> pd.DataFrame:  # type: ignore[name-defined]
-    """
-    Em CI (GITHUB_ACTIONS=true) ou com USE_HTTP=1 => usa HTTP (requests).
-    Localmente, se Selenium disponível e USE_HTTP!=1 => usa navegador.
-    """
     use_http = GHA or (os.getenv("USE_HTTP", "").lower() in ("1", "true", "yes"))
     url = build_url_parametrized(BASE_URL, yyyymm)
 
@@ -199,7 +197,7 @@ def fetch_pix_por_municipio(driver: "webdriver.Chrome | None", yyyymm: int) -> p
         df.sort_values(by=sort_cols, inplace=True, ignore_index=True)
     return df
 
-# ---------- filtro por RS usando código IBGE ----------
+# ---------- filtro por RS ----------
 def _find_mun_code_column(df: pd.DataFrame) -> str | None:
     candidates_by_name = [c for c in df.columns if any(k in c.lower() for k in ["ibge", "cod", "codigo"]) and "mun" in c.lower()]
     preferred = ["MunicipioCodigoIBGE", "MunicipioIBGE", "CodigoIBGE", "CodIBGE", "MunicipioCodigo", "CodMunicipioIBGE"]
@@ -208,7 +206,7 @@ def _find_mun_code_column(df: pd.DataFrame) -> str | None:
             return p
     for c in candidates_by_name:
         return c
-    # heurística para achar coluna com códigos de 7 dígitos (43xxxxx para RS)
+    # heurística p/ 7 dígitos (43xxxxx para RS)
     for c in df.columns:
         s = df[c]
         if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
@@ -392,10 +390,11 @@ def load_existing_wide_t(xlsx_path: str, sheet_name: str) -> pd.DataFrame | None
 def write_wide_t_only(df_wide_t: pd.DataFrame, xlsx_path: str):
     """
     Reescreve o arquivo do zero contendo APENAS a aba 'wide_t'.
-    (Atende ao pedido de excluir a 'wide'.)
     """
     if df_wide_t is None or df_wide_t.empty:
         raise RuntimeError("Nada para escrever em 'wide_t'.")
+    # garante diretório
+    ensure_out_dir(os.path.dirname(xlsx_path) or ".")
     with pd.ExcelWriter(xlsx_path, engine="openpyxl", mode="w") as writer:
         df_wide_t.to_excel(writer, sheet_name=SHEET_WIDE_T, index=False)
 
@@ -404,18 +403,19 @@ def write_wide_t_only(df_wide_t: pd.DataFrame, xlsx_path: str):
 # =======================
 def main_batch(start_yyyymm: int, end_yyyymm: int):
     run_dt = datetime.now(ZoneInfo("America/Sao_Paulo"))
-    run_stamp_col = run_dt.strftime("run_%Y%m%d_%H%M%S")  # nome da coluna-snapshot (timestamp só no cabeçalho)
+    run_stamp_col = run_dt.strftime("run_%Y%m%d_%H%M%S")
 
     ensure_out_dir(OUT_DIR)
     print(f"[INFO] Execução em {run_dt.isoformat()} | Intervalo: {start_yyyymm}..{end_yyyymm} (inclusive)")
+    print(f"[INFO] OUT_XLSX = {OUT_XLSX}")
 
-    # Decide método de coleta (HTTP no CI; Selenium local, se disponível)
+    # Decide método de coleta (HTTP no CI; Selenium local se disponível)
     use_http = GHA or (os.getenv("USE_HTTP", "").lower() in ("1", "true", "yes"))
 
     driver = None
     if not use_http:
         if webdriver is None or Options is None:
-            raise RuntimeError("Selenium indisponível: instale 'selenium' ou defina USE_HTTP=1 para usar coleta HTTP.")
+            raise RuntimeError("Selenium indisponível: instale 'selenium' ou defina USE_HTTP=1 para usar HTTP.")
         chrome_opts = Options()
         chrome_opts.add_argument("--headless=new")
         chrome_opts.add_argument("--disable-gpu")
@@ -427,7 +427,7 @@ def main_batch(start_yyyymm: int, end_yyyymm: int):
 
     months_processed = 0
     months_skipped_empty = 0
-    new_wide_list = []
+    new_wide_list: list[pd.DataFrame] = []
 
     try:
         for yyyymm in iter_yyyymm(start_yyyymm, end_yyyymm):
@@ -472,14 +472,8 @@ def main_batch(start_yyyymm: int, end_yyyymm: int):
     df_transposed_final = merge_wide_t(existing_wide_t, df_transposed_new)
 
     # ============== COLUNA SNAPSHOT COM DADOS (NÃO TEXTO) ==============
-    # Define o mês alvo do snapshot: por padrão, o mês final do intervalo
     target_month = str(end_yyyymm)
-
-    # Se o mês alvo ainda não existir (ex.: API retornou só meses anteriores),
-    # escolhe o maior AAAAMM disponível após o merge
-    month_cols_final = sorted(
-        [c for c in df_transposed_final.columns if re.fullmatch(r"\d{6}", str(c) or "")]
-    )
+    month_cols_final = sorted([c for c in df_transposed_final.columns if re.fullmatch(r"\d{6}", str(c) or "")])
     if target_month not in month_cols_final and month_cols_final:
         target_month = month_cols_final[-1]
 
@@ -487,16 +481,15 @@ def main_batch(start_yyyymm: int, end_yyyymm: int):
     while run_stamp_col in df_transposed_final.columns:
         run_stamp_col = run_stamp_col + "_v2"
 
-    # Cria a coluna de execução COPIANDO os valores numéricos do mês alvo
+    # Cria a coluna de execução copiando os valores do mês alvo
     if target_month in df_transposed_final.columns:
         df_transposed_final[run_stamp_col] = pd.to_numeric(
             df_transposed_final[target_month], errors="coerce"
         )
     else:
-        # fallback (improvável): se não houver nenhum mês, cria coluna vazia
         df_transposed_final[run_stamp_col] = np.nan
-    # ================================================================
 
+    # Escreve/atualiza o Excel
     try:
         write_wide_t_only(df_transposed_final, OUT_XLSX)
     except Exception as e:
@@ -504,9 +497,9 @@ def main_batch(start_yyyymm: int, end_yyyymm: int):
         sys.exit(1)
 
     print("\n========================")
-    print(f"[OK] Arquivo atualizado: '{OUT_XLSX}' | Aba única: '{SHEET_WIDE_T}' (histórico preservado)")
-    print(f"[RESUMO] Meses processados: {months_processed} | Meses vazios/pulados: {months_skipped_empty}")
-    print(f"[INFO] Nova coluna criada com snapshot do mês {target_month}: {run_stamp_col}")
+    print(f"[OK] Atualizado: '{OUT_XLSX}' | Aba: '{SHEET_WIDE_T}' (histórico preservado)")
+    print(f"[RESUMO] Meses processados: {months_processed} | Vazios/pulados: {months_skipped_empty}")
+    print(f"[INFO] Nova coluna (snapshot de {target_month}): {run_stamp_col}")
     print("[DICA] Rode novamente quando quiser — cada rodada criará UMA NOVA COLUNA de snapshot sem apagar as anteriores.")
 
 # =======================
@@ -519,3 +512,4 @@ if __name__ == "__main__":
         print("[ERRO] Parâmetros inválidos:", e)
         sys.exit(1)
     main_batch(start_yyyymm, end_yyyymm)
+
