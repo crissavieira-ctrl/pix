@@ -1,30 +1,29 @@
-name: Run Pix Bot (Daily)
+name: Run Pix Bot (TEST every 5 min)
 
 on:
   schedule:
-    # 21:20 Brasília (UTC-3) => 00:20 UTC
-    - cron: "20 0 * * *"
-    # opcional: retry 15 min depois
-    - cron: "35 0 * * *"
-  workflow_dispatch: {}
+    - cron: "*/5 * * * *"   # roda a cada 5 minutos (UTC)
+  workflow_dispatch:
 
 permissions:
-  contents: write   # permite commitar no repositório
+  contents: write
+
+# Evita duas execuções em paralelo se uma demorar >5min
+concurrency:
+  group: pix-bot
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      # Força modo HTTP (sem Selenium) no CI
       GITHUB_ACTIONS: "true"
-      # Salva/ler o Excel na raiz do repositório
       OUT_DIR: "."
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # garante histórico para commit
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -44,18 +43,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Se precisar de segredos, use:
-      # - name: Export secrets
-      #   run: |
-      #     echo "API_KEY=${{ secrets.API_KEY }}" >> $GITHUB_ENV
-
-      - name: Run bot (mês padrão ou intervalo)
+      - name: Run bot
         run: |
+          echo "Trigger: ${{ github.event_name }} at $(date -u) UTC"
           python bot.py
-          # Exemplo para intervalo:
+          # Para intervalo específico:
           # python bot.py 202501 202508
 
-      - name: Upload Excel as artifact (backup/consulta)
+      - name: Upload Excel as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -70,7 +65,6 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add pix_pordia.xlsx
-            # só commita se houver mudança
             if git diff --cached --quiet; then
               echo "Nenhuma mudança no Excel. Nada a commitar."
             else
