@@ -4,7 +4,7 @@ on:
   schedule:
     # AJUSTE O HORÁRIO AQUI (sempre em UTC):
     # Ex.: 07:30 em Brasília (BRT = UTC-3) => 10:30 UTC
-    - cron: "30 10 * * *"
+    - cron: "10 00 * * *"
   workflow_dispatch: {}   # permite rodar manualmente
 
 jobs:
