@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 Coleta Pix/BCB por município, filtra apenas RS e agrega (sem municípios),
-gravando SOMENTE a aba TRANSPOSTA 'wide_t' (histórico preservado).
+gravando a aba TRANSPOSTA 'wide_t' (histórico preservado) e, opcionalmente,
+uma aba com uma LINHA por rodada: 'snapshots_run'.
 
 A cada execução:
 - Mescla os meses coletados ao histórico de 'wide_t' (não apaga nada).
-- Cria uma NOVA COLUNA com snapshot dos valores do mês alvo (end_yyyymm),
-  chamada: run_YYYYMMDD_HHMMSS. O timestamp fica no nome; os valores são numéricos.
+- Cria uma NOVA COLUNA com snapshot do mês alvo (end_yyyymm) chamada: run_YYYYMMDD_HHMMSS.
+- Opcionalmente, adiciona uma NOVA LINHA na aba 'snapshots_run' com o mesmo snapshot.
 
 Regras:
 - Padrão: coleta o MÊS CORRENTE (AAAAMM de hoje).
 - Também aceita 1 AAAAMM (único mês) ou 2 AAAAMM (intervalo inclusivo).
+
+Modo de snapshot (variável de ambiente SNAPSHOT_MODE):
+- 'column'  -> só coluna em wide_t
+- 'row'     -> só linha em snapshots_run
+- 'both'    -> coluna + linha (DEFAULT)
 """
 
 from __future__ import annotations
@@ -40,17 +46,15 @@ from urllib3.util.retry import Retry
 # =======================
 # CONFIGURAÇÕES
 # =======================
-# Detecta ambiente GitHub Actions
 GHA = os.getenv("GITHUB_ACTIONS", "").lower() in ("1", "true", "yes")
 
-# Caminho de saída:
-# - No CI (Actions), o workflow define OUT_DIR=".", então salva na raiz do repo
-# - Localmente, mantém o caminho anterior por padrão (pode sobrescrever com OUT_DIR)
 DEFAULT_OUT_DIR = r"D:\User\Desktop\pix"
 OUT_DIR = os.getenv("OUT_DIR", "." if GHA else DEFAULT_OUT_DIR)
 OUT_XLSX = os.path.join(OUT_DIR, "pix_pordia.xlsx")
 
-SHEET_WIDE_T = "wide_t"   # única aba mantida
+SHEET_WIDE_T = "wide_t"           # séries (linhas = métricas; colunas = meses + run_*)
+SHEET_SNAP_ROW = "snapshots_run"  # nova aba (linhas = rodadas; colunas = ID_Metrica)
+SNAPSHOT_MODE = os.getenv("SNAPSHOT_MODE", "both").strip().lower()  # 'column' | 'row' | 'both'
 
 BASE_URL = (
     "https://olinda.bcb.gov.br/olinda/servico/"
@@ -67,11 +71,6 @@ def yyyymm_ok(s: str) -> bool:
     return len(s) == 6 and s.isdigit() and s[4:] != "00" and 1 <= int(s[4:]) <= 12
 
 def parse_cli_range(args: list[str]) -> tuple[int, int]:
-    """
-    Padrão: MÊS CORRENTE (start=end=AAAAMM de hoje).
-    1 parâmetro: start=end=AAAAMM informado.
-    2 parâmetros: intervalo inclusivo [start..end].
-    """
     current_yyyymm = month_to_yyyymm(date.today())
     if len(args) == 0:
         return current_yyyymm, current_yyyymm
@@ -111,7 +110,6 @@ def build_url_parametrized(base_url: str, yyyymm: int) -> str:
         f"&$top=10000"
     )
 
-# ---------- coleta sem navegador (CI/HTTP) ----------
 def fetch_json_via_http(url: str) -> dict:
     sess = requests.Session()
     retries = Retry(
@@ -125,7 +123,6 @@ def fetch_json_via_http(url: str) -> dict:
     r.raise_for_status()
     return r.json()
 
-# ---------- coleta com navegador (local, Selenium) ----------
 def fetch_json_via_browser(driver: "webdriver.Chrome", url: str) -> dict:  # type: ignore[name-defined]
     script = """
         const url = arguments[0];
@@ -134,17 +131,11 @@ def fetch_json_via_browser(driver: "webdriver.Chrome", url: str) -> dict:  # typ
             try {
                 const r = await fetch(url, { method: 'GET' });
                 const text = await r.text();
-                if (!r.ok) {
-                    done({ ok: false, status: r.status, body: text, url });
-                    return;
-                }
+                if (!r.ok) { done({ ok: false, status: r.status, body: text, url }); return; }
                 let json;
-                try { json = JSON.parse(text); }
-                catch (e) { done({ ok: false, status: r.status, body: text, parseError: String(e), url }); return; }
+                try { json = JSON.parse(text); } catch (e) { done({ ok: false, status: r.status, body: text, parseError: String(e), url }); return; }
                 done({ ok: true, data: json, url });
-            } catch (err) {
-                done({ ok: false, error: String(err), url });
-            }
+            } catch (err) { done({ ok: false, error: String(err), url }); }
         })();
     """
     result = driver.execute_async_script(script, url)
@@ -162,28 +153,17 @@ def fetch_json_via_browser(driver: "webdriver.Chrome", url: str) -> dict:  # typ
 def ensure_out_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
-# ---------- dispatcher: escolhe HTTP (CI) ou Selenium (local) ----------
 def fetch_pix_por_municipio(driver: "webdriver.Chrome | None", yyyymm: int) -> pd.DataFrame:  # type: ignore[name-defined]
     use_http = GHA or (os.getenv("USE_HTTP", "").lower() in ("1", "true", "yes"))
     url = build_url_parametrized(BASE_URL, yyyymm)
-
-    if use_http:
-        payload = fetch_json_via_http(url)
-    else:
-        if driver is None:
-            raise RuntimeError("Driver Selenium não inicializado.")
-        payload = fetch_json_via_browser(driver, url)
-
+    payload = fetch_json_via_http(url) if use_http else fetch_json_via_browser(driver, url)  # type: ignore[arg-type]
     if "value" not in payload:
         raise RuntimeError(f"Resposta inesperada do Olinda (sem 'value'). URL: {url}")
 
     rows = payload.get("value", [])
     next_link = payload.get("@odata.nextLink")
     while next_link:
-        if use_http:
-            payload = fetch_json_via_http(next_link)
-        else:
-            payload = fetch_json_via_browser(driver, next_link)
+        payload = fetch_json_via_http(next_link) if use_http else fetch_json_via_browser(driver, next_link)  # type: ignore[arg-type]
         if "value" not in payload:
             raise RuntimeError(f"Resposta inesperada em paginação. URL: {next_link}")
         rows.extend(payload.get("value", []))
@@ -206,18 +186,17 @@ def _find_mun_code_column(df: pd.DataFrame) -> str | None:
             return p
     for c in candidates_by_name:
         return c
-    # heurística p/ 7 dígitos (43xxxxx para RS)
     for c in df.columns:
-        s = df[c]
-        if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
-            valid_frac = (s.dropna().astype(int).between(1100000, 5399999)).mean() if len(s.dropna()) else 0
-            if valid_frac > 0.8:
-                return c
-        elif pd.api.types.is_object_dtype(s):
-            sample = s.dropna().astype(str).str.replace(r"\D", "", regex=True)
-            valid_frac = ((sample.str.len() == 7) & sample.str.isnumeric()).mean() if len(sample) else 0
-            if valid_frac > 0.8:
-                return c
+            s = df[c]
+            if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
+                valid_frac = (s.dropna().astype(int).between(1100000, 5399999)).mean() if len(s.dropna()) else 0
+                if valid_frac > 0.8:
+                    return c
+            elif pd.api.types.is_object_dtype(s):
+                sample = s.dropna().astype(str).str.replace(r"\D", "", regex=True)
+                valid_frac = ((sample.str.len() == 7) & sample.str.isnumeric()).mean() if len(sample) else 0
+                if valid_frac > 0.8:
+                    return c
     return None
 
 def filter_only_rs(df: pd.DataFrame) -> pd.DataFrame:
@@ -255,15 +234,9 @@ def identify_id_and_value_columns(df: pd.DataFrame):
     return id_cols, val_cols
 
 def to_wide_for_month(df_raw: pd.DataFrame, yyyymm: int) -> pd.DataFrame:
-    """
-    Gera um 'wide' somente para o mês, para depois transpor.
-    (Não é mais acumulado em Excel; apenas serve de insumo para a wide_t.)
-    """
     if df_raw.empty:
         return pd.DataFrame()
     df_work = filter_only_rs(df_raw)
-
-    # remove granularidade municipal (agrega RS inteiro)
     drop_cols = []
     if "Municipio" in df_work.columns:
         drop_cols.append("Municipio")
@@ -286,7 +259,6 @@ def to_wide_for_month(df_raw: pd.DataFrame, yyyymm: int) -> pd.DataFrame:
     else:
         df_agg = df_num.drop_duplicates(subset=id_cols)
 
-    # renomeia métricas para incluir apenas o AAAAMM (sem run stamp aqui)
     rename_map = {}
     for c in df_agg.columns:
         if c in id_cols:
@@ -301,7 +273,6 @@ def to_wide_for_month(df_raw: pd.DataFrame, yyyymm: int) -> pd.DataFrame:
     df_agg = df_agg.rename(columns=rename_map)
     return df_agg
 
-# ---------- transpor o WIDE p/ "uma coluna por mês" ----------
 _COL_RE = re.compile(r"^(?P<base>.+?)_(?P<yyyymm>\d{6})(?:_v\d+)?$")
 
 def _extract_col_meta(col: str):
@@ -348,10 +319,6 @@ def transpose_wide(df_wide: pd.DataFrame) -> pd.DataFrame:
     return wide_t
 
 def merge_wide_t(existing_wide_t: pd.DataFrame | None, new_wide_t: pd.DataFrame) -> pd.DataFrame:
-    """
-    Mantém colunas extras da wide_t existente e adiciona/atualiza meses da nova.
-    Chave: 'ID_Metrica'. Faz outer join e resolve duplicatas priorizando valores novos não nulos.
-    """
     if existing_wide_t is None or existing_wide_t.empty:
         return new_wide_t.copy()
     if "ID_Metrica" not in existing_wide_t.columns:
@@ -369,7 +336,7 @@ def merge_wide_t(existing_wide_t: pd.DataFrame | None, new_wide_t: pd.DataFrame)
     merged = merged[["ID_Metrica"] + month_cols + other_cols]
     return merged
 
-def load_existing_wide_t(xlsx_path: str, sheet_name: str) -> pd.DataFrame | None:
+def load_existing_sheet(xlsx_path: str, sheet_name: str) -> pd.DataFrame | None:
     if not os.path.exists(xlsx_path):
         return None
     try:
@@ -387,16 +354,15 @@ def load_existing_wide_t(xlsx_path: str, sheet_name: str) -> pd.DataFrame | None
     except Exception:
         return None
 
-def write_wide_t_only(df_wide_t: pd.DataFrame, xlsx_path: str):
-    """
-    Reescreve o arquivo do zero contendo APENAS a aba 'wide_t'.
-    """
-    if df_wide_t is None or df_wide_t.empty:
-        raise RuntimeError("Nada para escrever em 'wide_t'.")
-    # garante diretório
+def write_sheets(xlsx_path: str, df_wide_t: pd.DataFrame | None, df_snap_row: pd.DataFrame | None):
+    if (df_wide_t is None or df_wide_t.empty) and (df_snap_row is None or df_snap_row.empty):
+        raise RuntimeError("Nada para escrever.")
     ensure_out_dir(os.path.dirname(xlsx_path) or ".")
     with pd.ExcelWriter(xlsx_path, engine="openpyxl", mode="w") as writer:
-        df_wide_t.to_excel(writer, sheet_name=SHEET_WIDE_T, index=False)
+        if df_wide_t is not None and not df_wide_t.empty:
+            df_wide_t.to_excel(writer, sheet_name=SHEET_WIDE_T, index=False)
+        if df_snap_row is not None and not df_snap_row.empty:
+            df_snap_row.to_excel(writer, sheet_name=SHEET_SNAP_ROW, index=False)
 
 # =======================
 # EXECUÇÃO
@@ -408,8 +374,8 @@ def main_batch(start_yyyymm: int, end_yyyymm: int):
     ensure_out_dir(OUT_DIR)
     print(f"[INFO] Execução em {run_dt.isoformat()} | Intervalo: {start_yyyymm}..{end_yyyymm} (inclusive)")
     print(f"[INFO] OUT_XLSX = {OUT_XLSX}")
+    print(f"[INFO] SNAPSHOT_MODE = {SNAPSHOT_MODE}")
 
-    # Decide método de coleta (HTTP no CI; Selenium local se disponível)
     use_http = GHA or (os.getenv("USE_HTTP", "").lower() in ("1", "true", "yes"))
 
     driver = None
@@ -423,7 +389,8 @@ def main_batch(start_yyyymm: int, end_yyyymm: int):
         chrome_opts.add_argument("--window-size=1200,900")
         driver = webdriver.Chrome(options=chrome_opts)
 
-    existing_wide_t = load_existing_wide_t(OUT_XLSX, SHEET_WIDE_T)
+    existing_wide_t = load_existing_sheet(OUT_XLSX, SHEET_WIDE_T)
+    existing_snap_row = load_existing_sheet(OUT_XLSX, SHEET_SNAP_ROW)
 
     months_processed = 0
     months_skipped_empty = 0
@@ -464,43 +431,83 @@ def main_batch(start_yyyymm: int, end_yyyymm: int):
         print("[AVISO] Nada novo para transpor (todas as coletas vazias?).")
         return
 
-    # Transpõe SOMENTE o que foi coletado nesta execução
     df_wide_this_run = pd.concat(new_wide_list, ignore_index=True).drop_duplicates()
     df_transposed_new = transpose_wide(df_wide_this_run)
-
-    # Mescla com a wide_t existente (mantém histórico)
     df_transposed_final = merge_wide_t(existing_wide_t, df_transposed_new)
 
-    # ============== COLUNA SNAPSHOT COM DADOS (NÃO TEXTO) ==============
+    # -------------- Determina mês-alvo para snapshot --------------
     target_month = str(end_yyyymm)
     month_cols_final = sorted([c for c in df_transposed_final.columns if re.fullmatch(r"\d{6}", str(c) or "")])
     if target_month not in month_cols_final and month_cols_final:
         target_month = month_cols_final[-1]
 
-    # Garante nome único para a coluna de snapshot
-    while run_stamp_col in df_transposed_final.columns:
-        run_stamp_col = run_stamp_col + "_v2"
-
-    # Cria a coluna de execução copiando os valores do mês alvo
-    if target_month in df_transposed_final.columns:
-        df_transposed_final[run_stamp_col] = pd.to_numeric(
-            df_transposed_final[target_month], errors="coerce"
-        )
+    # -------------- SNAPSHOT EM COLUNA (wide_t) --------------
+    df_to_write_wide = df_transposed_final.copy()
+    if SNAPSHOT_MODE in ("column", "both"):
+        # garante nome único
+        col_name = run_stamp_col
+        while col_name in df_to_write_wide.columns:
+            col_name = col_name + "_v2"
+        if target_month in df_to_write_wide.columns:
+            df_to_write_wide[col_name] = pd.to_numeric(df_to_write_wide[target_month], errors="coerce")
+        else:
+            df_to_write_wide[col_name] = np.nan
     else:
-        df_transposed_final[run_stamp_col] = np.nan
+        # não criar a coluna de snapshot
+        pass
 
-    # Escreve/atualiza o Excel
+    # -------------- SNAPSHOT EM LINHA (snapshots_run) --------------
+    df_to_write_snap = None
+    if SNAPSHOT_MODE in ("row", "both"):
+        # série com valores do mês-alvo por ID_Metrica
+        if "ID_Metrica" not in df_transposed_final.columns or target_month not in df_transposed_final.columns:
+            snap_series = pd.Series(dtype=float)
+        else:
+            snap_series = pd.to_numeric(
+                df_transposed_final.set_index("ID_Metrica")[target_month],
+                errors="coerce"
+            )
+        # monta linha única
+        new_row = {"run_stamp": run_stamp_col, "target_month": target_month}
+        new_row.update({k: float(v) if pd.notna(v) else np.nan for k, v in snap_series.to_dict().items()})
+
+        snap_df_new = pd.DataFrame([new_row])
+
+        # concilia com existente (união de colunas)
+        if existing_snap_row is None or existing_snap_row.empty:
+            df_to_write_snap = snap_df_new
+        else:
+            # garante união ordenada: fixos + métricas ordenadas
+            all_cols = list(existing_snap_row.columns)
+            for c in snap_df_new.columns:
+                if c not in all_cols:
+                    all_cols.append(c)
+            # garante colunas fixas primeiro
+            fixed = ["run_stamp", "target_month"]
+            metric_cols = [c for c in all_cols if c not in fixed]
+            ordered = fixed + sorted(metric_cols)
+            existing_aligned = existing_snap_row.reindex(columns=ordered)
+            new_aligned = snap_df_new.reindex(columns=ordered)
+            df_to_write_snap = pd.concat([existing_aligned, new_aligned], ignore_index=True)
+
+    # -------------- Escreve Excel (ambos ou um) --------------
     try:
-        write_wide_t_only(df_transposed_final, OUT_XLSX)
+        write_sheets(OUT_XLSX,
+                     df_wide_t=df_to_write_wide if SNAPSHOT_MODE in ("column", "both") else df_transposed_final,
+                     df_snap_row=df_to_write_snap)
     except Exception as e:
         print("[ERRO] Falha ao escrever o Excel:", repr(e))
         sys.exit(1)
 
     print("\n========================")
-    print(f"[OK] Atualizado: '{OUT_XLSX}' | Aba: '{SHEET_WIDE_T}' (histórico preservado)")
+    print(f"[OK] Atualizado: '{OUT_XLSX}' | Abas: '{SHEET_WIDE_T}'" + (f", '{SHEET_SNAP_ROW}'" if SNAPSHOT_MODE in ('row','both') else ""))
     print(f"[RESUMO] Meses processados: {months_processed} | Vazios/pulados: {months_skipped_empty}")
-    print(f"[INFO] Nova coluna (snapshot de {target_month}): {run_stamp_col}")
-    print("[DICA] Rode novamente quando quiser — cada rodada criará UMA NOVA COLUNA de snapshot sem apagar as anteriores.")
+    print(f"[INFO] Mês alvo no snapshot: {target_month}")
+    print(f"[INFO] Modo de snapshot: {SNAPSHOT_MODE}")
+    if SNAPSHOT_MODE in ("column", "both"):
+        print(f"[INFO] Nova coluna em '{SHEET_WIDE_T}': {run_stamp_col} (valores numéricos de {target_month})")
+    if SNAPSHOT_MODE in ("row", "both"):
+        print(f"[INFO] Nova linha em '{SHEET_SNAP_ROW}': run_stamp={run_stamp_col}")
 
 # =======================
 # ENTRYPOINT
@@ -512,4 +519,5 @@ if __name__ == "__main__":
         print("[ERRO] Parâmetros inválidos:", e)
         sys.exit(1)
     main_batch(start_yyyymm, end_yyyymm)
+
 
