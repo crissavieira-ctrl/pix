@@ -1,31 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Coleta Pix/BCB por município, filtra apenas RS e agrega (sem municípios),
-gravando a aba TRANSPOSTA 'wide_t' (histórico preservado) e, opcionalmente,
-uma aba com uma LINHA por rodada: 'snapshots_run'.
+Coleta Pix/BCB por município, filtra RS e agrega (sem municípios).
+Mantém:
+- wide_t: séries (métricas x meses) + snapshot em COLUNA (run_YYYYMMDD_HHMMSS)
+- snapshots_run: snapshot em LINHA (uma por execução)
+- snapshots_diff: SALDO DIÁRIO = (dia atual) - (dia anterior)
+  * se não houver dia anterior, escreve linha com métricas em branco (NaN)
 
-A cada execução:
-- Mescla os meses coletados ao histórico de 'wide_t' (não apaga nada).
-- Cria uma NOVA COLUNA com snapshot do mês alvo (end_yyyymm) chamada: run_YYYYMMDD_HHMMSS.
-- Opcionalmente, adiciona uma NOVA LINHA na aba 'snapshots_run' com o mesmo snapshot.
-
-Regras:
-- Padrão: coleta o MÊS CORRENTE (AAAAMM de hoje).
-- Também aceita 1 AAAAMM (único mês) ou 2 AAAAMM (intervalo inclusivo).
-
-Modo de snapshot (variável de ambiente SNAPSHOT_MODE):
-- 'column'  -> só coluna em wide_t
-- 'row'     -> só linha em snapshots_run
-- 'both'    -> coluna + linha (DEFAULT)
+SNAPSHOT_MODE:
+- 'column' -> só coluna em wide_t
+- 'row'    -> só linha em snapshots_run (+ snapshots_diff)
+- 'both'   -> coluna + linha (+ snapshots_diff) [DEFAULT]
 """
 
 from __future__ import annotations
 
-# --- Selenium opcional (usado só localmente, no CI usamos HTTP) ---
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
-except Exception:  # sem selenium disponível
+except Exception:
     webdriver = None  # type: ignore
     Options = None    # type: ignore
 
@@ -33,12 +26,11 @@ import pandas as pd
 import numpy as np
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import re
 
-# Coleta via HTTP (CI/GitHub Actions)
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -52,9 +44,10 @@ DEFAULT_OUT_DIR = r"D:\User\Desktop\pix"
 OUT_DIR = os.getenv("OUT_DIR", "." if GHA else DEFAULT_OUT_DIR)
 OUT_XLSX = os.path.join(OUT_DIR, "pix_pordia.xlsx")
 
-SHEET_WIDE_T = "wide_t"           # séries (linhas = métricas; colunas = meses + run_*)
-SHEET_SNAP_ROW = "snapshots_run"  # nova aba (linhas = rodadas; colunas = ID_Metrica)
-SNAPSHOT_MODE = os.getenv("SNAPSHOT_MODE", "both").strip().lower()  # 'column' | 'row' | 'both'
+SHEET_WIDE_T   = "wide_t"
+SHEET_SNAP_ROW = "snapshots_run"
+SHEET_SNAP_DIFF= "snapshots_diff"   # <<< NOVA ABA
+SNAPSHOT_MODE  = os.getenv("SNAPSHOT_MODE", "both").strip().lower()  # 'column'|'row'|'both'
 
 BASE_URL = (
     "https://olinda.bcb.gov.br/olinda/servico/"
@@ -68,7 +61,7 @@ def month_to_yyyymm(d: date) -> int:
     return d.year * 100 + d.month
 
 def yyyymm_ok(s: str) -> bool:
-    return len(s) == 6 and s.isdigit() and s[4:] != "00" and 1 <= int(s[4:]) <= 12
+    return len(s) == 6 and s.isdigit() and "01" <= s[4:] <= "12"
 
 def parse_cli_range(args: list[str]) -> tuple[int, int]:
     current_yyyymm = month_to_yyyymm(date.today())
@@ -187,16 +180,16 @@ def _find_mun_code_column(df: pd.DataFrame) -> str | None:
     for c in candidates_by_name:
         return c
     for c in df.columns:
-            s = df[c]
-            if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
-                valid_frac = (s.dropna().astype(int).between(1100000, 5399999)).mean() if len(s.dropna()) else 0
-                if valid_frac > 0.8:
-                    return c
-            elif pd.api.types.is_object_dtype(s):
-                sample = s.dropna().astype(str).str.replace(r"\D", "", regex=True)
-                valid_frac = ((sample.str.len() == 7) & sample.str.isnumeric()).mean() if len(sample) else 0
-                if valid_frac > 0.8:
-                    return c
+        s = df[c]
+        if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
+            valid_frac = (s.dropna().astype(int).between(1100000, 5399999)).mean() if len(s.dropna()) else 0
+            if valid_frac > 0.8:
+                return c
+        elif pd.api.types.is_object_dtype(s):
+            sample = s.dropna().astype(str).str.replace(r"\D", "", regex=True)
+            valid_frac = ((sample.str.len() == 7) & sample.str.isnumeric()).mean() if len(sample) else 0
+            if valid_frac > 0.8:
+                return c
     return None
 
 def filter_only_rs(df: pd.DataFrame) -> pd.DataFrame:
@@ -354,8 +347,13 @@ def load_existing_sheet(xlsx_path: str, sheet_name: str) -> pd.DataFrame | None:
     except Exception:
         return None
 
-def write_sheets(xlsx_path: str, df_wide_t: pd.DataFrame | None, df_snap_row: pd.DataFrame | None):
-    if (df_wide_t is None or df_wide_t.empty) and (df_snap_row is None or df_snap_row.empty):
+def write_sheets(xlsx_path: str,
+                 df_wide_t: pd.DataFrame | None,
+                 df_snap_row: pd.DataFrame | None,
+                 df_snap_diff: pd.DataFrame | None):
+    if ((df_wide_t is None or df_wide_t.empty)
+        and (df_snap_row is None or df_snap_row.empty)
+        and (df_snap_diff is None or df_snap_diff.empty)):
         raise RuntimeError("Nada para escrever.")
     ensure_out_dir(os.path.dirname(xlsx_path) or ".")
     with pd.ExcelWriter(xlsx_path, engine="openpyxl", mode="w") as writer:
@@ -363,6 +361,85 @@ def write_sheets(xlsx_path: str, df_wide_t: pd.DataFrame | None, df_snap_row: pd
             df_wide_t.to_excel(writer, sheet_name=SHEET_WIDE_T, index=False)
         if df_snap_row is not None and not df_snap_row.empty:
             df_snap_row.to_excel(writer, sheet_name=SHEET_SNAP_ROW, index=False)
+        if df_snap_diff is not None and not df_snap_diff.empty:
+            df_snap_diff.to_excel(writer, sheet_name=SHEET_SNAP_DIFF, index=False)
+
+# ------------------- utilidades para SNAPSHOTS -------------------
+_RUN_DATE_RE = re.compile(r"^run_(\d{8})_\d{6}")
+
+def extract_run_date_from_stamp(run_stamp: str) -> str | None:
+    """Extrai YYYYMMDD de run_YYYYMMDD_HHMMSS."""
+    m = _RUN_DATE_RE.match(str(run_stamp))
+    return m.group(1) if m else None
+
+def ensure_run_date_col(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Garante coluna run_date (YYYYMMDD) em snapshots_run existente."""
+    if df is None or df.empty:
+        return df
+    if "run_date" not in df.columns:
+        df = df.copy()
+        df["run_date"] = df["run_stamp"].apply(lambda s: extract_run_date_from_stamp(str(s)))
+    return df
+
+def build_daily_diff_row(existing_snap_row: pd.DataFrame | None,
+                         new_row_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcula (dia atual) - (dia anterior).
+    Se não existir linha do dia anterior, retorna linha com métricas NaN.
+    """
+    # new_row_df tem 1 linha com run_stamp, run_date, target_month + métricas
+    cur = new_row_df.iloc[0]
+    cur_date = str(cur.get("run_date", "")) or extract_run_date_from_stamp(str(cur["run_stamp"]))
+    cur_stamp = str(cur["run_stamp"])
+    prev_date_dt = datetime.strptime(cur_date, "%Y%m%d").date() - timedelta(days=1)
+    prev_date = prev_date_dt.strftime("%Y%m%d")
+
+    fixed_cols = ["run_stamp", "run_date", "prev_run_stamp", "prev_run_date", "target_month"]
+
+    # sem base anterior -> linha vazia (NaN nas métricas)
+    if existing_snap_row is None or existing_snap_row.empty:
+        out = {"run_stamp": cur_stamp, "run_date": cur_date, "prev_run_stamp": None,
+               "prev_run_date": prev_date, "target_month": cur.get("target_month")}
+        # métricas = todas as chaves métrica da própria new_row_df (exceto fixos)
+        metric_cols = [c for c in new_row_df.columns if c not in ("run_stamp","run_date","target_month")]
+        for c in metric_cols:
+            out[c] = np.nan
+        return pd.DataFrame([out])
+
+    # garantir run_date na base
+    base = ensure_run_date_col(existing_snap_row).copy()
+
+    # localizar linha exatamente do dia anterior
+    prev_rows = base.loc[base["run_date"] == prev_date]
+    if prev_rows.empty:
+        out = {"run_stamp": cur_stamp, "run_date": cur_date, "prev_run_stamp": None,
+               "prev_run_date": prev_date, "target_month": cur.get("target_month")}
+        metric_cols = [c for c in new_row_df.columns if c not in ("run_stamp","run_date","target_month")]
+        for c in metric_cols:
+            out[c] = np.nan
+        return pd.DataFrame([out])
+
+    # se houver várias no dia anterior, usa a última (ordem da planilha)
+    prev = prev_rows.iloc[-1]
+
+    # união de colunas de métricas
+    metric_cols = sorted(list(set([c for c in base.columns if c not in ("run_stamp","run_date","target_month")]
+                                  + [c for c in new_row_df.columns if c not in ("run_stamp","run_date","target_month")])))
+    out = {
+        "run_stamp": cur_stamp,
+        "run_date": cur_date,
+        "prev_run_stamp": prev["run_stamp"],
+        "prev_run_date": prev_date,
+        "target_month": cur.get("target_month")
+    }
+    for c in metric_cols:
+        cur_val  = pd.to_numeric(cur.get(c, np.nan), errors="coerce")
+        prev_val = pd.to_numeric(prev.get(c, np.nan), errors="coerce")
+        if pd.notna(cur_val) and pd.notna(prev_val):
+            out[c] = float(cur_val) - float(prev_val)
+        else:
+            out[c] = np.nan
+    return pd.DataFrame([out])
 
 # =======================
 # EXECUÇÃO
@@ -370,6 +447,7 @@ def write_sheets(xlsx_path: str, df_wide_t: pd.DataFrame | None, df_snap_row: pd
 def main_batch(start_yyyymm: int, end_yyyymm: int):
     run_dt = datetime.now(ZoneInfo("America/Sao_Paulo"))
     run_stamp_col = run_dt.strftime("run_%Y%m%d_%H%M%S")
+    run_date = run_dt.strftime("%Y%m%d")
 
     ensure_out_dir(OUT_DIR)
     print(f"[INFO] Execução em {run_dt.isoformat()} | Intervalo: {start_yyyymm}..{end_yyyymm} (inclusive)")
@@ -391,6 +469,7 @@ def main_batch(start_yyyymm: int, end_yyyymm: int):
 
     existing_wide_t = load_existing_sheet(OUT_XLSX, SHEET_WIDE_T)
     existing_snap_row = load_existing_sheet(OUT_XLSX, SHEET_SNAP_ROW)
+    existing_snap_diff= load_existing_sheet(OUT_XLSX, SHEET_SNAP_DIFF)
 
     months_processed = 0
     months_skipped_empty = 0
@@ -444,7 +523,6 @@ def main_batch(start_yyyymm: int, end_yyyymm: int):
     # -------------- SNAPSHOT EM COLUNA (wide_t) --------------
     df_to_write_wide = df_transposed_final.copy()
     if SNAPSHOT_MODE in ("column", "both"):
-        # garante nome único
         col_name = run_stamp_col
         while col_name in df_to_write_wide.columns:
             col_name = col_name + "_v2"
@@ -452,14 +530,11 @@ def main_batch(start_yyyymm: int, end_yyyymm: int):
             df_to_write_wide[col_name] = pd.to_numeric(df_to_write_wide[target_month], errors="coerce")
         else:
             df_to_write_wide[col_name] = np.nan
-    else:
-        # não criar a coluna de snapshot
-        pass
 
     # -------------- SNAPSHOT EM LINHA (snapshots_run) --------------
     df_to_write_snap = None
+    snap_df_new = None
     if SNAPSHOT_MODE in ("row", "both"):
-        # série com valores do mês-alvo por ID_Metrica
         if "ID_Metrica" not in df_transposed_final.columns or target_month not in df_transposed_final.columns:
             snap_series = pd.Series(dtype=float)
         else:
@@ -467,48 +542,75 @@ def main_batch(start_yyyymm: int, end_yyyymm: int):
                 df_transposed_final.set_index("ID_Metrica")[target_month],
                 errors="coerce"
             )
-        # monta linha única
-        new_row = {"run_stamp": run_stamp_col, "target_month": target_month}
+        # linha da execução
+        new_row = {"run_stamp": run_stamp_col, "run_date": run_date, "target_month": target_month}
         new_row.update({k: float(v) if pd.notna(v) else np.nan for k, v in snap_series.to_dict().items()})
-
         snap_df_new = pd.DataFrame([new_row])
 
-        # concilia com existente (união de colunas)
+        # concilia com existente
         if existing_snap_row is None or existing_snap_row.empty:
             df_to_write_snap = snap_df_new
         else:
-            # garante união ordenada: fixos + métricas ordenadas
+            # união ordenada
             all_cols = list(existing_snap_row.columns)
             for c in snap_df_new.columns:
                 if c not in all_cols:
                     all_cols.append(c)
-            # garante colunas fixas primeiro
-            fixed = ["run_stamp", "target_month"]
+            fixed = ["run_stamp", "run_date", "target_month"]
             metric_cols = [c for c in all_cols if c not in fixed]
             ordered = fixed + sorted(metric_cols)
             existing_aligned = existing_snap_row.reindex(columns=ordered)
             new_aligned = snap_df_new.reindex(columns=ordered)
             df_to_write_snap = pd.concat([existing_aligned, new_aligned], ignore_index=True)
 
-    # -------------- Escreve Excel (ambos ou um) --------------
+    # -------------- SALDO DIÁRIO (snapshots_diff) --------------
+    df_to_write_diff = None
+    if SNAPSHOT_MODE in ("row", "both"):
+        # Garantir base com run_date
+        existing_snap_row = ensure_run_date_col(existing_snap_row)
+        # Construir a linha de diff desta execução
+        diff_row = build_daily_diff_row(existing_snap_row, snap_df_new if snap_df_new is not None else pd.DataFrame([{"run_stamp": run_stamp_col, "run_date": run_date, "target_month": target_month}]))
+        if existing_snap_diff is None or existing_snap_diff.empty:
+            df_to_write_diff = diff_row
+        else:
+            # união de colunas (fixos + métricas)
+            all_cols = list(existing_snap_diff.columns)
+            for c in diff_row.columns:
+                if c not in all_cols:
+                    all_cols.append(c)
+            fixed = ["run_stamp", "run_date", "prev_run_stamp", "prev_run_date", "target_month"]
+            metric_cols = [c for c in all_cols if c not in fixed]
+            ordered = fixed + sorted(metric_cols)
+            existing_aligned = existing_snap_diff.reindex(columns=ordered)
+            new_aligned = diff_row.reindex(columns=ordered)
+            df_to_write_diff = pd.concat([existing_aligned, new_aligned], ignore_index=True)
+
+    # -------------- Escreve Excel --------------
     try:
-        write_sheets(OUT_XLSX,
-                     df_wide_t=df_to_write_wide if SNAPSHOT_MODE in ("column", "both") else df_transposed_final,
-                     df_snap_row=df_to_write_snap)
+        write_sheets(
+            OUT_XLSX,
+            df_wide_t = (df_to_write_wide if SNAPSHOT_MODE in ("column","both") else df_transposed_final),
+            df_snap_row = df_to_write_snap,
+            df_snap_diff = df_to_write_diff
+        )
     except Exception as e:
         print("[ERRO] Falha ao escrever o Excel:", repr(e))
         sys.exit(1)
 
     print("\n========================")
-    print(f"[OK] Atualizado: '{OUT_XLSX}' | Abas: '{SHEET_WIDE_T}'" + (f", '{SHEET_SNAP_ROW}'" if SNAPSHOT_MODE in ('row','both') else ""))
+    abas = [SHEET_WIDE_T]
+    if SNAPSHOT_MODE in ('row','both'):
+        abas.append(SHEET_SNAP_ROW)
+        abas.append(SHEET_SNAP_DIFF)
+    print(f"[OK] Atualizado: '{OUT_XLSX}' | Abas: {', '.join(abas)}")
     print(f"[RESUMO] Meses processados: {months_processed} | Vazios/pulados: {months_skipped_empty}")
     print(f"[INFO] Mês alvo no snapshot: {target_month}")
     print(f"[INFO] Modo de snapshot: {SNAPSHOT_MODE}")
     if SNAPSHOT_MODE in ("column", "both"):
         print(f"[INFO] Nova coluna em '{SHEET_WIDE_T}': {run_stamp_col} (valores numéricos de {target_month})")
     if SNAPSHOT_MODE in ("row", "both"):
-        print(f"[INFO] Nova linha em '{SHEET_SNAP_ROW}': run_stamp={run_stamp_col}")
-
+        print(f"[INFO] Nova linha em '{SHEET_SNAP_ROW}': run_stamp={run_stamp_col} (run_date={run_date})")
+        print(f"[INFO] Nova linha em '{SHEET_SNAP_DIFF}': saldo diário vs dia anterior (ou vazio se ausente)")
 # =======================
 # ENTRYPOINT
 # =======================
@@ -519,5 +621,6 @@ if __name__ == "__main__":
         print("[ERRO] Parâmetros inválidos:", e)
         sys.exit(1)
     main_batch(start_yyyymm, end_yyyymm)
+
 
 
